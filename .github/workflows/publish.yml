@@ -1,0 +1,49 @@
+name: Publish
+
+# Tag-triggered publish via PyPI trusted publishing (GitHub Actions OIDC).
+# No API token exists for this project: the job mints a short-lived OIDC
+# credential, so there is no secret to rotate and nothing to expire. PyPI
+# generates PEP 740 attestations automatically under trusted publishing.
+#
+# One-time setup on pypi.org (Account settings -> Publishing -> add pending publisher):
+#   PyPI project name:  pdfops
+#   Owner:              pdfops
+#   Repository:         pdfops-python
+#   Workflow filename:  publish.yml
+#   Environment name:   (blank)
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install --upgrade build
+      - run: python -m build
+      - run: python -m unittest discover -s tests -t .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write   # required for OIDC
+      contents: read
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
