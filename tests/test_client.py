@@ -1,6 +1,6 @@
 """Offline tests for the pdfops client — a fake transport records every request.
 
-Run:  python3 -m unittest discover -s python/tests -t python
+Run:  python3 -m unittest discover -s tests -t .
 """
 
 from __future__ import annotations
@@ -149,6 +149,132 @@ class Endpoints(unittest.TestCase):
         self.assertEqual((method, url), ("POST", "https://pdfops.dev/api/signup"))
         self.assertNotIn("X-API-Key", headers)
         self.assertEqual(json.loads(body), {"email": "dev@example.com"})
+
+
+def fields_of(t: "FakeTransport"):
+    """Last call -> (url, [(name, filename, value-or-bytes)]) with text parts decoded."""
+    _, url, headers, body = t.calls[-1]
+    return url, [(n, fn, d) for n, fn, _c, d in parts_of(body, headers["Content-Type"])]
+
+
+def text_fields(t: "FakeTransport"):
+    url, parts = fields_of(t)
+    assert parts[0] == ("pdf", "input.pdf", PDF)
+    return url, [(n, d.decode()) for n, _fn, d in parts[1:]]
+
+
+class PageOperations(unittest.TestCase):
+    def test_extract_and_delete_pages(self):
+        for method, path in (("extract_pages", "extract-pages"), ("delete_pages", "delete-pages")):
+            t = FakeTransport(body=PDF)
+            self.assertEqual(getattr(PdfOps(transport=t), method)(PDF, "1-3,5"), PDF)
+            self.assertEqual(text_fields(t), (f"https://pdfops.dev/api/{path}", [("pages", "1-3,5")]))
+            getattr(PdfOps(transport=t), method)(PDF, "2", password="pw")
+            self.assertEqual(text_fields(t)[1], [("pages", "2"), ("password", "pw")])
+
+    def test_rotate_sends_degrees_as_string_and_omits_pages(self):
+        t = FakeTransport(body=PDF)
+        PdfOps(transport=t).rotate(PDF, -90)
+        self.assertEqual(text_fields(t), ("https://pdfops.dev/api/rotate", [("degrees", "-90")]))
+        PdfOps(transport=t).rotate(PDF, 180, pages="1,3", password="pw")
+        self.assertEqual(text_fields(t)[1], [("degrees", "180"), ("pages", "1,3"), ("password", "pw")])
+
+    def test_split_decodes_base64_parts(self):
+        import base64
+        api = {"count": 2, "parts": [
+            {"pages": "1-2", "page_count": 2, "pdf": base64.b64encode(b"%PDF-A").decode()},
+            {"pages": "3", "page_count": 1, "pdf": base64.b64encode(b"%PDF-B").decode()},
+        ]}
+        t = FakeTransport(body=json.dumps(api).encode())
+        res = PdfOps(transport=t).split(PDF, ranges="1-2,3")
+        self.assertEqual(text_fields(t), ("https://pdfops.dev/api/split", [("ranges", "1-2,3")]))
+        self.assertEqual(res.count, 2)
+        self.assertEqual([(p.pages, p.page_count, p.pdf) for p in res.parts], [("1-2", 2, b"%PDF-A"), ("3", 1, b"%PDF-B")])
+        PdfOps(transport=t).split(PDF, every=5, password="pw")
+        self.assertEqual(text_fields(t)[1], [("every", "5"), ("password", "pw")])
+
+    def test_watermark_all_options_and_defaults_omitted(self):
+        t = FakeTransport(body=PDF)
+        PdfOps(transport=t).watermark(PDF, "DRAFT")
+        self.assertEqual(text_fields(t), ("https://pdfops.dev/api/watermark", [("text", "DRAFT")]))
+        PdfOps(transport=t).watermark(
+            PDF, "DRAFT", opacity=0.25, size=36, color="#ff0000", rotation=30,
+            position="top", pages="1-2", password="pw",
+        )
+        self.assertEqual(text_fields(t)[1], [
+            ("text", "DRAFT"), ("opacity", "0.25"), ("size", "36"), ("color", "#ff0000"),
+            ("rotation", "30"), ("position", "top"), ("pages", "1-2"), ("password", "pw"),
+        ])
+
+    def test_text_parts_are_utf8_text_plain(self):
+        t = FakeTransport(body=PDF)
+        PdfOps(transport=t).watermark(PDF, "Entw\u00fcrfe \u2014 \u00e9")
+        _, _, headers, body = t.calls[-1]
+        name, _fn, ctype, data = parts_of(body, headers["Content-Type"])[1]
+        self.assertEqual((name, ctype, data), ("text", "text/plain", "Entw\u00fcrfe \u2014 \u00e9".encode("utf-8")))
+
+    def test_page_numbers_options(self):
+        t = FakeTransport(body=PDF)
+        PdfOps(transport=t).page_numbers(PDF)
+        self.assertEqual(text_fields(t), ("https://pdfops.dev/api/page-numbers", []))
+        PdfOps(transport=t).page_numbers(
+            PDF, format="Page {n} of {total}", position="top-left", size=12, start=0, margin=20,
+            pages="2-", password="pw",
+        )
+        self.assertEqual(text_fields(t)[1], [
+            ("format", "Page {n} of {total}"), ("position", "top-left"), ("size", "12"),
+            ("start", "0"), ("margin", "20"), ("pages", "2-"), ("password", "pw"),
+        ])
+
+    def test_unlock_note_header(self):
+        t = FakeTransport(body=PDF, headers={"x-pdfops-note": "not-encrypted"})
+        res = PdfOps(transport=t).unlock(PDF)
+        self.assertEqual(text_fields(t), ("https://pdfops.dev/api/unlock", []))
+        self.assertEqual((res.pdf, res.note), (PDF, "not-encrypted"))
+        res = PdfOps(transport=FakeTransport(body=PDF, headers={"X-Pdfops-Note": "not-encrypted"})).unlock(PDF)
+        self.assertEqual(res.note, "not-encrypted")
+        t = FakeTransport(body=PDF)
+        res = PdfOps(transport=t).unlock(PDF, "pw")
+        self.assertEqual((res.pdf, res.note), (PDF, None))
+        self.assertEqual(text_fields(t)[1], [("password", "pw")])
+
+    def test_protect_joins_permissions_and_empty_list_allows_none(self):
+        t = FakeTransport(body=PDF)
+        PdfOps(transport=t).protect(PDF, user_password="u", owner_password="o", permissions=["print", "copy"], password="pw")
+        self.assertEqual(text_fields(t), ("https://pdfops.dev/api/protect", [
+            ("user_password", "u"), ("owner_password", "o"), ("permissions", "print,copy"), ("password", "pw"),
+        ]))
+        PdfOps(transport=t).protect(PDF, user_password="u", permissions=[])
+        self.assertEqual(text_fields(t)[1], [("user_password", "u"), ("permissions", "")])
+        PdfOps(transport=t).protect(PDF, owner_password="o")
+        self.assertEqual(text_fields(t)[1], [("owner_password", "o")])
+
+    def test_metadata_returns_json_dict(self):
+        api = {"page_count": 2, "pages": [{"width": 612, "height": 792, "rotation": 0}], "title": None,
+               "encrypted": False, "has_form": False, "form_field_count": 0, "form_field_count_capped": False}
+        t = FakeTransport(body=json.dumps(api).encode())
+        self.assertEqual(PdfOps(transport=t).metadata(PDF), api)
+        self.assertEqual(text_fields(t), ("https://pdfops.dev/api/metadata", []))
+        PdfOps(transport=t).metadata(PDF, password="pw")
+        self.assertEqual(text_fields(t)[1], [("password", "pw")])
+
+    def test_set_metadata_joins_keywords_and_keeps_empty_strings(self):
+        t = FakeTransport(body=PDF)
+        PdfOps(transport=t).set_metadata(
+            PDF, title="T", author="A", subject="S", creator="C", keywords=["a", "b"], password="pw"
+        )
+        self.assertEqual(text_fields(t), ("https://pdfops.dev/api/set-metadata", [
+            ("title", "T"), ("author", "A"), ("subject", "S"), ("creator", "C"),
+            ("keywords", "a,b"), ("password", "pw"),
+        ]))
+        PdfOps(transport=t).set_metadata(PDF, title="")
+        self.assertEqual(text_fields(t)[1], [("title", "")])
+
+    def test_page_op_errors_surface_slug(self):
+        t = FakeTransport(status=400, body=json.dumps({"error": "invalid_pages", "details": "page 9 out of range"}).encode())
+        with self.assertRaises(PdfOpsError) as cm:
+            PdfOps(transport=t).extract_pages(PDF, "9")
+        self.assertEqual(cm.exception.code, "invalid_pages")
 
 
 class Errors(unittest.TestCase):

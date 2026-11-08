@@ -1,6 +1,6 @@
 # pdfops
 
-Python client for the [PDFops API](https://pdfops.dev): **fill** AcroForm PDFs, **merge** PDFs, **inspect** form fields, and **generate invoices** with one HTTP call. No native dependencies, no headless browser, nothing to install but this package.
+Python client for the [PDFops API](https://pdfops.dev): **fill** AcroForm PDFs, **merge** and **split** PDFs, run **page operations** (extract, delete, rotate, watermark, page numbers), **protect / unlock** and edit **metadata**, **inspect** form fields, and **generate invoices** with one HTTP call. No native dependencies, no headless browser, nothing to install but this package.
 
 Built for the moment `pypdf` / `PyPDFForm` stop cooperating — appearance streams that never render, `NeedAppearances` flags, encrypted government blanks, checkboxes that will not tick — and for runtimes where a PDF toolchain does not fit: Lambda, Cloud Functions, Airflow tasks, notebooks.
 
@@ -42,6 +42,21 @@ invoice = client.invoice({
 })
 ```
 
+Page operations, one line each (all keyword-only options are optional and omitted when unset):
+
+```python
+first_two = client.extract_pages("in.pdf", "1-2")
+trimmed = client.delete_pages("in.pdf", "2,4-6")
+turned = client.rotate("in.pdf", 90, pages="1")
+res = client.split("in.pdf", ranges="1-2,3-")       # or every=5; res.parts[0].pdf is bytes
+marked = client.watermark("in.pdf", "DRAFT", opacity=0.2)
+numbered = client.page_numbers("in.pdf", format="Page {n} of {total}", position="bottom-right")
+opened = client.unlock("locked.pdf")                # opened.pdf, opened.note ("not-encrypted" or None)
+sealed = client.protect("in.pdf", user_password="s3cret", permissions=["print"])   # [] allows none
+info = client.metadata("in.pdf")                    # info["page_count"], info["title"], ...
+titled = client.set_metadata("in.pdf", title="Q3 report", keywords=["finance", "q3"])
+```
+
 PDF inputs may be `bytes`, a path (`str` / `pathlib.Path`), or a binary file object. Every PDF-producing call returns `bytes`.
 
 ## API
@@ -52,6 +67,16 @@ PDF inputs may be `bytes`, a path (`str` / `pathlib.Path`), or a binary file obj
 | `fill_form(pdf, fields, *, flatten=False)` | `POST /api/fill-form` | filled PDF `bytes` |
 | `merge([pdf, pdf, ...])` | `POST /api/merge` | merged PDF `bytes` |
 | `invoice(request)` | `POST /api/invoice` | invoice PDF `bytes` |
+| `extract_pages(pdf, pages, *, password=None)` | `POST /api/extract-pages` | PDF `bytes` with only those pages, in that order |
+| `delete_pages(pdf, pages, *, password=None)` | `POST /api/delete-pages` | PDF `bytes` without those pages |
+| `rotate(pdf, degrees, *, pages=None, password=None)` | `POST /api/rotate` | rotated PDF `bytes` (90, 180, 270, -90) |
+| `split(pdf, *, ranges=None, every=None, password=None)` | `POST /api/split` | `SplitResult` — `count`, `parts[]` of `pages`, `page_count`, `pdf` bytes |
+| `watermark(pdf, text, *, opacity, size, color, rotation, position, pages, password)` | `POST /api/watermark` | watermarked PDF `bytes` |
+| `page_numbers(pdf, *, format, position, size, start, margin, pages, password)` | `POST /api/page-numbers` | numbered PDF `bytes` |
+| `unlock(pdf, password=None)` | `POST /api/unlock` | `UnlockResult` — `pdf` bytes plus optional `note` |
+| `protect(pdf, *, user_password, owner_password, permissions, password)` | `POST /api/protect` | encrypted PDF `bytes` |
+| `metadata(pdf, *, password=None)` | `POST /api/metadata` | `dict` — page count, page sizes, title, author, dates, form field count |
+| `set_metadata(pdf, *, title, author, subject, creator, keywords, password)` | `POST /api/set-metadata` | PDF `bytes` with the info fields written |
 | `usage()` | `GET /api/usage` | `dict` — tier, limit, used, remaining, resets_at |
 | `signup(email)` | `POST /api/signup` | `None` — the key is emailed |
 
