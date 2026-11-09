@@ -63,9 +63,9 @@ PDF inputs may be `bytes`, a path (`str` / `pathlib.Path`), or a binary file obj
 
 | Method | Endpoint | Returns |
 |---|---|---|
-| `inspect(pdf)` | `POST /api/inspect` | `dict` — `count`, `hasXFA`, `fields[]`, `fillTemplate` |
-| `fill_form(pdf, fields, *, flatten=False)` | `POST /api/fill-form` | filled PDF `bytes` |
-| `merge([pdf, pdf, ...])` | `POST /api/merge` | merged PDF `bytes` |
+| `inspect(pdf, *, password=None)` | `POST /api/inspect` | `dict` — `count`, `hasXFA`, `fields[]`, `fillTemplate` |
+| `fill_form(pdf, fields, *, flatten=False, password=None)` | `POST /api/fill-form` | filled PDF `bytes` |
+| `merge([pdf, pdf, ...], *, password=None)` | `POST /api/merge` | merged PDF `bytes` |
 | `invoice(request)` | `POST /api/invoice` | invoice PDF `bytes` |
 | `extract_pages(pdf, pages, *, password=None)` | `POST /api/extract-pages` | PDF `bytes` with only those pages, in that order |
 | `delete_pages(pdf, pages, *, password=None)` | `POST /api/delete-pages` | PDF `bytes` without those pages |

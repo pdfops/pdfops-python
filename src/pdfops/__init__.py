@@ -26,7 +26,7 @@ from urllib import error as urlerror
 from urllib import request as urlrequest
 
 __all__ = ["PdfOps", "PdfOpsError", "PdfInput", "SplitPart", "SplitResult", "UnlockResult", "__version__"]
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 #: A PDF given as raw bytes, a filesystem path, or a binary file object.
 PdfInput = Union[bytes, bytearray, memoryview, str, "os.PathLike[str]", IO[bytes]]
@@ -152,6 +152,10 @@ class PdfOps:
             h["X-API-Key"] = self.api_key
         if self.client_tag:
             h["X-Pdfops-Client"] = self.client_tag
+            # Same rule as the TS SDK: the package version describes the "py"
+            # tag only; an embedding tool's tag has its own version.
+            if self.client_tag == "py":
+                h["X-Pdfops-Client-Version"] = __version__
         if extra:
             h.update(extra)
         return h
@@ -193,22 +197,29 @@ class PdfOps:
 
     # ── API ─────────────────────────────────────────────────────────────────
 
-    def inspect(self, pdf: PdfInput) -> Dict[str, Any]:
+    def inspect(self, pdf: PdfInput, *, password: Optional[str] = None) -> Dict[str, Any]:
         """List a PDF's AcroForm fields plus a paste-ready ``fillTemplate``.
 
         Returns ``{"count", "hasXFA", "fields": [...], "fillTemplate": {...}}``.
-        A PDF with no form returns ``count == 0`` — not an error.
+        A PDF with no form returns ``count == 0`` — not an error. ``password``
+        opens a user-password PDF.
         """
-        data = self._post_pdf("/api/inspect", [("pdf", "input.pdf", _read_pdf(pdf), "application/pdf")])
+        parts: List[Tuple[str, Optional[str], bytes, str]] = [("pdf", "input.pdf", _read_pdf(pdf), "application/pdf")]
+        if password is not None:
+            parts.append(("password", None, password.encode("utf-8"), "text/plain"))
+        data = self._post_pdf("/api/inspect", parts)
         return json.loads(data.decode("utf-8"))
 
-    def fill_form(self, pdf: PdfInput, fields: Mapping[str, str], *, flatten: bool = False) -> bytes:
+    def fill_form(
+        self, pdf: PdfInput, fields: Mapping[str, str], *, flatten: bool = False, password: Optional[str] = None
+    ) -> bytes:
         """Fill AcroForm fields; returns the filled PDF bytes.
 
         Field names must exist in the PDF — use :meth:`inspect` to discover
         them. Checkbox values are the strings ``"true"``/``"false"``; choice
         fields take one of their options. ``flatten=True`` bakes values into
         the page content and drops the form so fields are no longer editable.
+        ``password`` opens a user-password PDF.
         """
         parts: List[Tuple[str, Optional[str], bytes, str]] = [
             ("pdf", "input.pdf", _read_pdf(pdf), "application/pdf"),
@@ -216,13 +227,20 @@ class PdfOps:
         ]
         if flatten:
             parts.append(("flatten", None, b"true", "text/plain"))
+        if password is not None:
+            parts.append(("password", None, password.encode("utf-8"), "text/plain"))
         return self._post_pdf("/api/fill-form", parts)
 
-    def merge(self, pdfs: Sequence[PdfInput]) -> bytes:
-        """Merge two or more PDFs, in order; returns the combined PDF bytes."""
+    def merge(self, pdfs: Sequence[PdfInput], *, password: Optional[str] = None) -> bytes:
+        """Merge two or more PDFs, in order; returns the combined PDF bytes.
+
+        ``password`` opens user-password inputs and applies to every input.
+        """
         if len(pdfs) < 2:
             raise PdfOpsError(400, "too_few_pdfs", "merge needs at least 2 PDFs")
-        parts = [("pdf", f"part-{i}.pdf", _read_pdf(p), "application/pdf") for i, p in enumerate(pdfs)]
+        parts: List[Tuple[str, Optional[str], bytes, str]] = [("pdf", f"part-{i}.pdf", _read_pdf(p), "application/pdf") for i, p in enumerate(pdfs)]
+        if password is not None:
+            parts.append(("password", None, password.encode("utf-8"), "text/plain"))
         return self._post_pdf("/api/merge", parts)
 
     def invoice(self, request: Mapping[str, Any]) -> bytes:

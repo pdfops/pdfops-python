@@ -13,6 +13,7 @@ import sys
 import tempfile
 import unittest
 from typing import List, Optional, Tuple
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
@@ -54,6 +55,7 @@ class HeadersAndInputs(unittest.TestCase):
         self.assertEqual(url, "https://pdfops.dev/api/fill-form")
         self.assertEqual(headers["X-API-Key"], "pdfops_live_x")
         self.assertEqual(headers["X-Pdfops-Client"], "py")
+        self.assertEqual(headers["X-Pdfops-Client-Version"], __version__)
         self.assertEqual(headers["User-Agent"], f"pdfops-python/{__version__}")
 
     def test_keyless_and_custom_tag_and_base_url(self):
@@ -114,6 +116,20 @@ class Endpoints(unittest.TestCase):
         _, _, headers, body = t.calls[0]
         self.assertEqual([p[0] for p in parts_of(body, headers["Content-Type"])], ["pdf", "fields"])
 
+    def test_password_forwarded_on_fill_inspect_merge(self):
+        for call, path in (
+            (lambda c: c.fill_form(PDF, {"a": "b"}, password="pw"), "/api/fill-form"),
+            (lambda c: c.merge([PDF, PDF], password="pw"), "/api/merge"),
+            (lambda c: c.inspect(PDF, password="pw"), "/api/inspect"),
+        ):
+            t = FakeTransport(body=b"{}" if path == "/api/inspect" else PDF)
+            call(PdfOps(transport=t))
+            _, url, headers, body = t.calls[0]
+            self.assertTrue(url.endswith(path))
+            parts = parts_of(body, headers["Content-Type"])
+            self.assertEqual(parts[-1][0], "password")
+            self.assertEqual(parts[-1][3], b"pw")
+
     def test_merge_order_and_minimum(self):
         t = FakeTransport(body=PDF)
         PdfOps(transport=t).merge([PDF, b"%PDF-2", b"%PDF-3"])
@@ -135,8 +151,12 @@ class Endpoints(unittest.TestCase):
         self.assertEqual(json.loads(body), req)
 
     def test_usage_requires_key_and_parses_json(self):
-        with self.assertRaises(PdfOpsError) as cm:
-            PdfOps(transport=FakeTransport()).usage()
+        # Isolated from a real PDFOPS_API_KEY sitting in the ambient
+        # environment (e.g. this box's cron env), which would otherwise
+        # make the client think a key was supplied.
+        with mock.patch.dict(os.environ, {"PDFOPS_API_KEY": ""}):
+            with self.assertRaises(PdfOpsError) as cm:
+                PdfOps(transport=FakeTransport()).usage()
         self.assertEqual(cm.exception.code, "missing_api_key")
         t = FakeTransport(body=json.dumps({"tier": "free", "limit": 250, "used": 3, "remaining": 247}).encode())
         u = PdfOps("k", transport=t).usage()

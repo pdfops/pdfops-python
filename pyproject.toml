@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pdfops"
-version = "0.2.0"
+version = "0.3.0"
 description = "Python client for the PDFops API: fill AcroForm PDFs, merge and split PDFs, page operations (extract, delete, rotate, watermark, page numbers), protect and unlock, edit metadata, inspect form fields, generate invoices. One HTTP call, no native deps, no headless browser."
 readme = "README.md"
 license = "MIT"
