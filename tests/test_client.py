@@ -297,13 +297,273 @@ class PageOperations(unittest.TestCase):
         self.assertEqual(cm.exception.code, "invalid_pages")
 
 
+class EdgeSuite(unittest.TestCase):
+    def test_extract_text_returns_json_and_sends_options(self):
+        api = {"pageCount": 1, "pages": [{"page": 1, "text": "hi", "tables": []}], "pagesWithoutText": [], "truncated": False}
+        t = FakeTransport(body=json.dumps(api).encode())
+        self.assertEqual(PdfOps(transport=t).extract_text(PDF), api)
+        self.assertEqual(text_fields(t), ("https://pdfops.dev/api/extract-text", []))
+        PdfOps(transport=t).extract_text(PDF, pages="2-", tables_format="csv", password="pw")
+        self.assertEqual(text_fields(t)[1], [("pages", "2-"), ("tables_format", "csv"), ("password", "pw")])
+
+    def test_extract_text_plain_exposes_truncated_header(self):
+        t = FakeTransport(body="a\fb".encode(), headers={"X-PDFops-Truncated": "true"})
+        res = PdfOps(transport=t).extract_text_plain(PDF, pages="1-2")
+        self.assertEqual((res.text, res.truncated), ("a\fb", True))
+        self.assertEqual(text_fields(t), ("https://pdfops.dev/api/extract-text", [("format", "text"), ("pages", "1-2")]))
+        res = PdfOps(transport=FakeTransport(body=b"x")).extract_text_plain(PDF)
+        self.assertEqual((res.text, res.truncated), ("x", False))
+
+    def test_extract_tables_xlsx_is_binary_and_exposes_headers(self):
+        xlsx = b"PK\x03\x04\x00\xffbinary"
+        hdrs = {"x-pdfops-truncated": "true", "X-PDFops-Truncated-By": "pages,sheets", "X-PDFops-Cells-Truncated": "true"}
+        t = FakeTransport(body=xlsx, headers=hdrs)
+        res = PdfOps(transport=t).extract_tables_xlsx(PDF, pages="1-3")
+        self.assertEqual((res.xlsx, res.truncated, res.truncated_by, res.cells_truncated), (xlsx, True, ["pages", "sheets"], True))
+        self.assertEqual(text_fields(t), ("https://pdfops.dev/api/extract-text", [("tables_format", "xlsx"), ("pages", "1-3")]))
+        res = PdfOps(transport=FakeTransport(body=xlsx)).extract_tables_xlsx(PDF)
+        self.assertEqual((res.truncated, res.truncated_by, res.cells_truncated), (False, [], False))
+
+    def test_extract_tables_xlsx_no_tables_error_keeps_body(self):
+        body = {"error": "no_tables", "details": "read stopped early", "truncated": True, "nextPage": 201}
+        t = FakeTransport(status=400, body=json.dumps(body).encode())
+        with self.assertRaises(PdfOpsError) as cm:
+            PdfOps(transport=t).extract_tables_xlsx(PDF)
+        self.assertEqual((cm.exception.code, cm.exception.body["nextPage"]), ("no_tables", 201))
+
+    def test_find_text_booleans_and_numbers(self):
+        api = {"count": 0, "truncated": False, "hits": [], "pagesWithoutText": [], "pagesScanned": 1, "nextPage": None}
+        t = FakeTransport(body=json.dumps(api).encode())
+        self.assertEqual(PdfOps(transport=t).find_text(PDF, "Total"), api)
+        self.assertEqual(text_fields(t), ("https://pdfops.dev/api/find-text", [("query", "Total")]))
+        PdfOps(transport=t).find_text(PDF, r"\d+", regex=True, case_sensitive=False, whole_word=True, pages="1-2", max_hits=5, password="pw")
+        self.assertEqual(text_fields(t)[1], [
+            ("query", r"\d+"), ("regex", "true"), ("case_sensitive", "false"), ("whole_word", "true"),
+            ("pages", "1-2"), ("max_hits", "5"), ("password", "pw"),
+        ])
+
+    def test_edit_sends_items_json_and_image_file_parts(self):
+        items = [{"type": "text", "page": 1, "x": 10, "y": 20, "text": "Hi"}, {"type": "image", "page": 1, "x": 0, "y": 0, "image": "logo"}]
+        png = b"\x89PNG\r\n\x1a\nfake"
+        t = FakeTransport(body=PDF)
+        self.assertEqual(PdfOps(transport=t).edit(PDF, items, images={"logo": png}, password="pw"), PDF)
+        url, parts = fields_of(t)
+        self.assertEqual(url, "https://pdfops.dev/api/edit")
+        self.assertEqual([p[0] for p in parts], ["pdf", "items", "password", "logo"])
+        self.assertEqual(json.loads(parts[1][2]), items)
+        self.assertEqual(parts[3], ("logo", "logo", png))
+
+    def test_add_fields_returns_pdf_and_warning(self):
+        fields = [{"type": "text", "name": "Name", "page": 1, "x": 50, "y": 700, "width": 200, "height": 20}]
+        t = FakeTransport(body=PDF)
+        res = PdfOps(transport=t).add_fields(PDF, fields)
+        self.assertEqual((res.pdf, res.warning), (PDF, None))
+        url, parts = text_fields(t)
+        self.assertEqual(url, "https://pdfops.dev/api/add-fields")
+        self.assertEqual(json.loads(parts[0][1]), fields)
+        t = FakeTransport(body=PDF, headers={"x-pdfops-warning": "xfa-layer-dropped; ..."})
+        self.assertEqual(PdfOps(transport=t).add_fields(PDF, fields, password="pw").warning, "xfa-layer-dropped; ...")
+        self.assertEqual(text_fields(t)[1][-1], ("password", "pw"))
+
+    def test_attach_parts_options_and_keys_header(self):
+        keys = [{"name": "data.xml", "key": "data.xml"}, {"name": "file-1", "key": "file-1"}]
+        t = FakeTransport(body=PDF, headers={"X-Pdfops-Attachment-Keys": json.dumps(keys)})
+        opts = [{"relationship": "Data"}]
+        res = PdfOps(transport=t).attach(PDF, [("data.xml", b"<a/>"), b"raw"], options=opts, password="pw")
+        self.assertEqual((res.pdf, res.attachment_keys), (PDF, keys))
+        _, _, headers, body = t.calls[0]
+        parts = parts_of(body, headers["Content-Type"])
+        self.assertEqual([(n, fn) for n, fn, _c, _d in parts], [
+            ("pdf", "input.pdf"), ("file", "data.xml"), ("file", "file-1"), ("options", None), ("password", None),
+        ])
+        self.assertEqual(parts[1][2:], ("application/xml", b"<a/>"))
+        self.assertEqual(parts[2][2], "application/octet-stream")
+        self.assertEqual(json.loads(parts[3][3]), opts)
+
+    def test_attach_path_uses_basename_and_missing_header_is_empty(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "note.txt")
+            with open(path, "wb") as fh:
+                fh.write(b"hello")
+            t = FakeTransport(body=PDF)
+            res = PdfOps(transport=t).attach(PDF, [path])
+        self.assertEqual(res.attachment_keys, [])
+        _, _, headers, body = t.calls[0]
+        self.assertEqual(parts_of(body, headers["Content-Type"])[1][:2], ("file", "note.txt"))
+
+    def test_html_to_pdf_json_body_and_headers(self):
+        t = FakeTransport(body=PDF, headers={"x-pdfops-pages": "3", "x-pdfops-blocked-requests": "2"})
+        res = PdfOps(transport=t).html_to_pdf("<h1>Hi</h1>", page_size="a4", landscape=False, margin={"top": 10, "left": 5}, scale=0.8)
+        self.assertEqual((res.pdf, res.pages, res.blocked_requests), (PDF, 3, 2))
+        method, url, headers, body = t.calls[0]
+        self.assertEqual((method, url, headers["Content-Type"]), ("POST", "https://pdfops.dev/api/html-to-pdf", "application/json"))
+        self.assertEqual(json.loads(body), {"html": "<h1>Hi</h1>", "page_size": "a4", "landscape": False, "margin": {"top": 10, "left": 5}, "scale": 0.8})
+        res = PdfOps(transport=FakeTransport(body=PDF)).html_to_pdf("<p>x</p>")
+        self.assertEqual((res.pages, res.blocked_requests), (None, None))
+
+    def test_image_to_pdf_repeats_pdf_field(self):
+        t = FakeTransport(body=PDF)
+        self.assertEqual(PdfOps(transport=t).image_to_pdf([b"\xff\xd8a", b"\x89PNGb"], page_size="a4", margin=0), PDF)
+        url, parts = fields_of(t)
+        self.assertEqual(url, "https://pdfops.dev/api/image-to-pdf")
+        self.assertEqual([(n, d) for n, _fn, d in parts], [("pdf", b"\xff\xd8a"), ("pdf", b"\x89PNGb"), ("page_size", b"a4"), ("margin", b"0")])
+
+    def test_text_to_pdf_json_body_omits_unset(self):
+        t = FakeTransport(body=PDF)
+        self.assertEqual(PdfOps(transport=t).text_to_pdf("# Hi"), PDF)
+        self.assertEqual(json.loads(t.calls[0][3]), {"content": "# Hi"})
+        PdfOps(transport=t).text_to_pdf("a,b", format="csv", page_numbers=False, font_size=9, title="T")
+        method, url, headers, body = t.calls[-1]
+        self.assertEqual((method, url, headers["Content-Type"]), ("POST", "https://pdfops.dev/api/text-to-pdf", "application/json"))
+        self.assertEqual(json.loads(body), {"content": "a,b", "format": "csv", "font_size": 9, "title": "T", "page_numbers": False})
+
+    def test_invoice_factur_x_passes_through_and_error_body_has_missing(self):
+        req = {"e_invoice": "factur-x", "from": {"name": "A", "country": "DE", "vat_id": "DE123456789"}, "to": {"name": "B", "country": "FR"},
+               "items": [{"description": "x", "unit": "C62", "unit_price": 1}], "currency": "EUR", "invoice_number": "1", "date": "2026-11-01", "due": "2026-12-01", "tax_rate": 19}
+        t = FakeTransport(body=PDF)
+        PdfOps(transport=t).invoice(req)
+        self.assertEqual(json.loads(t.calls[0][3]), req)
+        err = {"error": "einvoice_fields_required", "details": "also requires: from.country", "missing": ["from.country", "items[0].unit"]}
+        t = FakeTransport(status=400, body=json.dumps(err).encode())
+        with self.assertRaises(PdfOpsError) as cm:
+            PdfOps(transport=t).invoice({"e_invoice": "factur-x"})
+        self.assertEqual((cm.exception.code, cm.exception.body["missing"]), ("einvoice_fields_required", ["from.country", "items[0].unit"]))
+        for code in ("invalid_einvoice_field", "unrenderable_text"):
+            t = FakeTransport(status=400, body=json.dumps({"error": code, "details": "d"}).encode())
+            with self.assertRaises(PdfOpsError) as cm:
+                PdfOps(transport=t).invoice(req)
+            self.assertEqual(cm.exception.code, code)
+
+
+class TrustBoundaries(unittest.TestCase):
+    def test_attach_pair_str_data_is_refused_not_read_as_path(self):
+        t = FakeTransport(body=PDF)
+        with self.assertRaises(TypeError) as cm:
+            PdfOps(transport=t).attach(PDF, [("a.xml", "/etc/hostname")])
+        self.assertIn("pathlib.Path", str(cm.exception))
+        self.assertEqual(t.calls, [])
+
+    def test_attach_pair_accepts_bytearray_fileobj_pathlike_and_list(self):
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "x.txt"
+            p.write_bytes(b"from-disk")
+            t = FakeTransport(body=PDF)
+            PdfOps(transport=t).attach(PDF, [("a", bytearray(b"1")), ("b", io.BytesIO(b"2")), ("c", p), ["d", b"4"]])
+        _, _, headers, body = t.calls[0]
+        got = [(fn, data) for n, fn, _c, data in parts_of(body, headers["Content-Type"]) if n == "file"]
+        self.assertEqual(got, [("a", b"1"), ("b", b"2"), ("c", b"from-disk"), ("d", b"4")])
+
+    def test_multipart_rejects_header_injection_chars(self):
+        for bad in ("a\r\nb", "a\nb", "a\0b"):
+            with self.assertRaises(ValueError):
+                PdfOps(transport=FakeTransport()).attach(PDF, [(bad, b"x")])
+            with self.assertRaises(ValueError):
+                PdfOps(transport=FakeTransport()).edit(PDF, [], images={bad: b"x"})
+
+    def test_attach_quote_names_travel_via_options_and_backslash_is_refused(self):
+        t = FakeTransport(body=PDF)
+        PdfOps(transport=t).attach(PDF, [('we"ird.xml', b"<a/>"), ("ok.xml", b"<b/>")], options=[{"relationship": "Data"}])
+        _, _, headers, body = t.calls[0]
+        parts = parts_of(body, headers["Content-Type"])
+        self.assertEqual([(n, fn) for n, fn, _c, _d in parts if n == "file"], [("file", "file-0"), ("file", "ok.xml")])
+        opts = json.loads([d for n, _f, _c, d in parts if n == "options"][0])
+        self.assertEqual(opts, [{"relationship": "Data", "name": 'we"ird.xml'}])
+        with self.assertRaises(ValueError):  # the API refuses backslashes in attachment names
+            PdfOps(transport=FakeTransport()).attach(PDF, [("C:\\dir\\a.xml", b"<a/>")])
+
+    def test_attach_accepts_a_path_as_the_name_and_none_options(self):
+        import pathlib
+        t = FakeTransport(body=PDF)
+        PdfOps(transport=t).attach(PDF, [(pathlib.Path("dir/a.xml"), b"<a/>"), ("b.xml", b"<b/>")], options=[None, {"relationship": "Data"}])
+        _, _, headers, body = t.calls[0]
+        parts = parts_of(body, headers["Content-Type"])
+        self.assertEqual([fn for n, fn, _c, _d in parts if n == "file"], ["a.xml", "b.xml"])
+        self.assertEqual(json.loads([d for n, _f, _c, d in parts if n == "options"][0]), [{}, {"relationship": "Data"}])
+
+    def test_edit_image_keys_validated(self):
+        for bad in ("pdf", "password", "items", "", "a b", 'a"b', "x" * 65, "é"):
+            t = FakeTransport(body=PDF)
+            with self.assertRaises(ValueError):
+                PdfOps(transport=t).edit(PDF, [], images={bad: b"x"})
+            self.assertEqual(t.calls, [])
+        PdfOps(transport=FakeTransport(body=PDF)).edit(PDF, [], images={"logo-1.v2_x": b"x"})
+
+    def test_untrusted_headers_never_raise(self):
+        for raw in ("not json", "{}", '"s"', "[1, null]", '[{"name": 1, "key": "k"}]', '[{"name": "n"}]'):
+            t = FakeTransport(body=PDF, headers={"x-pdfops-attachment-keys": raw})
+            self.assertEqual(PdfOps(transport=t).attach(PDF, [("a", b"x")]).attachment_keys, [])
+        # one bad entry, or a count that differs from the files sent, drops them all (no shifted keys)
+        t = FakeTransport(body=PDF, headers={"x-pdfops-attachment-keys": '[{"name": "n", "key": "k", "x": 1}, 5]'})
+        self.assertEqual(PdfOps(transport=t).attach(PDF, [("a", b"x"), ("b", b"y")]).attachment_keys, [])
+        t = FakeTransport(body=PDF, headers={"x-pdfops-attachment-keys": '[null, {"name": "b", "key": "k"}]'})
+        self.assertEqual(PdfOps(transport=t).attach(PDF, [("a", b"x"), ("b", b"y")]).attachment_keys, [])
+        t = FakeTransport(body=PDF, headers={"x-pdfops-attachment-keys": '[{"name": "n", "key": "k", "x": 1}]'})
+        self.assertEqual(PdfOps(transport=t).attach(PDF, [("a", b"x")]).attachment_keys, [{"name": "n", "key": "k"}])
+        for v in ("٣", "1.5", "-1", " 3", "", "9" * 40):
+            t = FakeTransport(body=PDF, headers={"x-pdfops-pages": v, "x-pdfops-blocked-requests": v})
+            res = PdfOps(transport=t).html_to_pdf("<p>x</p>")
+            self.assertEqual((res.pages, res.blocked_requests), (None, None), v)
+
+    def test_extract_text_refuses_xlsx(self):
+        t = FakeTransport(body=b"PK")
+        with self.assertRaises(ValueError) as cm:
+            PdfOps(transport=t).extract_text(PDF, tables_format="xlsx")
+        self.assertIn("extract_tables_xlsx", str(cm.exception))
+        self.assertEqual(t.calls, [])
+
+    def test_urllib_transport_does_not_follow_redirects(self):
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        seen: List[str] = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                seen.append(self.path)
+                self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                if self.path == "/api/inspect":
+                    self.send_response(302)
+                    self.send_header("Location", "/elsewhere")
+                    self.end_headers()
+                else:
+                    self.send_response(200)
+                    self.end_headers()
+
+            def do_GET(self):
+                seen.append("GET " + self.path)
+                self.send_response(200)
+                self.end_headers()
+
+            def log_message(self, *a):
+                pass
+
+        srv = HTTPServer(("127.0.0.1", 0), Handler)
+        th = threading.Thread(target=srv.serve_forever, daemon=True)
+        th.start()
+        try:
+            c = PdfOps("secret", base_url=f"http://127.0.0.1:{srv.server_port}")
+            with self.assertRaises(PdfOpsError) as cm:
+                c.inspect(PDF)
+        finally:
+            srv.shutdown()
+            srv.server_close()
+        self.assertEqual(cm.exception.status, 302)
+        self.assertEqual(seen, ["/api/inspect"])
+
+
 class Errors(unittest.TestCase):
+    def test_non_json_error_has_no_body(self):
+        t = FakeTransport(status=502, body=b"Bad Gateway")
+        with self.assertRaises(PdfOpsError) as cm:
+            PdfOps(transport=t).inspect(PDF)
+        self.assertIsNone(cm.exception.body)
+
     def test_structured_api_error(self):
-        t = FakeTransport(status=422, body=json.dumps({"error": "unknown_field", "details": "No field named Nmae"}).encode())
+        t = FakeTransport(status=400, body=json.dumps({"error": "unknown_field", "details": "No field named Nmae"}).encode())
         with self.assertRaises(PdfOpsError) as cm:
             PdfOps(transport=t).fill_form(PDF, {"Nmae": "x"})
         e = cm.exception
-        self.assertEqual((e.status, e.code, e.details), (422, "unknown_field", "No field named Nmae"))
+        self.assertEqual((e.status, e.code, e.details), (400, "unknown_field", "No field named Nmae"))
         self.assertEqual(str(e), "unknown_field: No field named Nmae")
 
     def test_non_json_error_falls_back_to_status(self):

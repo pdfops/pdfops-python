@@ -17,16 +17,21 @@ from __future__ import annotations
 
 import base64
 import json
+import mimetypes
 import os
+import re
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import PurePath
 from typing import IO, Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 from urllib import error as urlerror
 from urllib import request as urlrequest
 
-__all__ = ["PdfOps", "PdfOpsError", "PdfInput", "SplitPart", "SplitResult", "UnlockResult", "__version__"]
-__version__ = "0.3.0"
+__all__ = [
+    "PdfOps", "PdfOpsError", "PdfInput", "SplitPart", "SplitResult", "UnlockResult", "AddFieldsResult",
+    "AttachResult", "ExtractTextPlainResult", "ExtractTablesXlsxResult", "HtmlToPdfResult", "__version__",
+]
+__version__ = "0.4.0"
 
 #: A PDF given as raw bytes, a filesystem path, or a binary file object.
 PdfInput = Union[bytes, bytearray, memoryview, str, "os.PathLike[str]", IO[bytes]]
@@ -64,14 +69,86 @@ class UnlockResult:
     note: Optional[str] = None
 
 
-class PdfOpsError(Exception):
-    """Structured API error. ``code`` is the API's stable ``error`` slug."""
+@dataclass(frozen=True)
+class AddFieldsResult:
+    pdf: bytes
+    #: The API's ``x-pdfops-warning`` header: set when the input had an XFA layer
+    #: that the save dropped. ``None`` otherwise.
+    warning: Optional[str] = None
 
-    def __init__(self, status: int, code: str, details: str) -> None:
+
+@dataclass(frozen=True)
+class AttachResult:
+    pdf: bytes
+    #: The API's ``x-pdfops-attachment-keys`` header, parsed: one
+    #: ``{"name", "key"}`` per added file, in request order (names cut to 40 characters).
+    attachment_keys: List[Dict[str, str]]
+
+
+@dataclass(frozen=True)
+class ExtractTextPlainResult:
+    #: Pages joined by a form feed.
+    text: str
+    #: The API's ``X-PDFops-Truncated`` header: the read stopped at a cap.
+    truncated: bool = False
+
+
+@dataclass(frozen=True)
+class ExtractTablesXlsxResult:
+    #: The .xlsx workbook bytes, one sheet per detected table.
+    xlsx: bytes
+    #: ``X-PDFops-Truncated``: a cap stopped the read or cut the workbook.
+    truncated: bool = False
+    #: ``X-PDFops-Truncated-By``: which caps (``pages``, ``output``, ``sheets``, ``columns``, ``rows``).
+    truncated_by: List[str] = field(default_factory=list)
+    #: ``X-PDFops-Cells-Truncated``: a cell over Excel's 32,767 characters was cut.
+    cells_truncated: bool = False
+
+
+@dataclass(frozen=True)
+class HtmlToPdfResult:
+    pdf: bytes
+    #: The API's ``x-pdfops-pages`` header: pages in the output, when sent.
+    pages: Optional[int] = None
+    #: The API's ``x-pdfops-blocked-requests`` header: resource requests the renderer refused, when sent.
+    blocked_requests: Optional[int] = None
+
+
+def _digits(v: Optional[str]) -> Optional[int]:
+    return int(v) if v is not None and v.isascii() and v.isdigit() and len(v) <= 9 else None
+
+
+# Fixed types for the common attachment extensions: ``mimetypes`` reads the machine's
+# MIME database, so the same call sent ``application/xml`` on one box and ``text/xml`` on another.
+_ATTACHMENT_MIME = {
+    ".xml": "application/xml", ".json": "application/json", ".csv": "text/csv", ".txt": "text/plain",
+    ".md": "text/markdown", ".html": "text/html", ".pdf": "application/pdf", ".png": "image/png",
+    ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+}
+
+
+def _attachment_mime(name: str) -> str:
+    ext = os.path.splitext(name)[1].lower()
+    return _ATTACHMENT_MIME.get(ext) or mimetypes.guess_type(name)[0] or "application/octet-stream"
+
+
+def _header(headers: Mapping[str, str], name: str) -> Optional[str]:
+    return next((v for k, v in headers.items() if k.lower() == name), None)
+
+
+class PdfOpsError(Exception):
+    """Structured API error. ``code`` is the API's stable ``error`` slug. ``body`` is
+    the parsed JSON error body when there was one, for fields beyond ``error`` and
+    ``details`` (e.g. ``missing`` on ``einvoice_fields_required``, ``nextPage`` on a
+    truncated ``no_tables``); otherwise ``None``."""
+
+    def __init__(self, status: int, code: str, details: str, body: Optional[Dict[str, Any]] = None) -> None:
         super().__init__(f"{code}: {details}")
         self.status = status
         self.code = code
         self.details = details
+        self.body = body
 
 
 def _read_pdf(pdf: PdfInput) -> bytes:
@@ -93,6 +170,11 @@ def _multipart(parts: Sequence[Tuple[str, Optional[str], bytes, str]]) -> Tuple[
     boundary = f"----pdfops-{uuid.uuid4().hex}"
     out = bytearray()
     for name, filename, data, ctype in parts:
+        # A name or filename is written into a quoted header value, so none of these may appear:
+        # CR, LF, NUL end the header; a quote or backslash would escape the quoting.
+        for label, value in (("name", name), ("filename", filename)):
+            if value is not None and any(ch in value for ch in '\r\n\0"\\'):
+                raise ValueError(f"multipart {label} may not contain CR, LF, NUL, a double quote or a backslash: {value!r}")
         out += f"--{boundary}\r\n".encode()
         disp = f'form-data; name="{name}"'
         if filename is not None:
@@ -105,11 +187,19 @@ def _multipart(parts: Sequence[Tuple[str, Optional[str], bytes, str]]) -> Tuple[
     return f"multipart/form-data; boundary={boundary}", bytes(out)
 
 
+class _NoRedirect(urlrequest.HTTPRedirectHandler):
+    def redirect_request(self, *args: Any, **kwargs: Any) -> None:  # type: ignore[override]
+        return None  # the 3xx is then raised as HTTPError and surfaces as PdfOpsError
+
+
 def _urllib_transport(timeout: float) -> Transport:
     def send(method: str, url: str, headers: Mapping[str, str], body: Optional[bytes]) -> Tuple[int, Mapping[str, str], bytes]:
         req = urlrequest.Request(url, data=body, method=method, headers=dict(headers))
+        # No redirects: a 3xx would forward X-API-Key and the body to another origin.
+        # Built per call, so proxy settings made after import are honoured as urlopen honours them.
+        opener = urlrequest.build_opener(_NoRedirect)
         try:
-            with urlrequest.urlopen(req, timeout=timeout) as res:  # noqa: S310 — fixed https origin
+            with opener.open(req, timeout=timeout) as res:
                 return res.status, dict(res.headers.items()), res.read()
         except urlerror.HTTPError as e:
             return e.code, dict(e.headers.items()), e.read()
@@ -170,14 +260,16 @@ class PdfOps:
         if 200 <= status < 300:
             return _res_headers, data
         code, details = f"http_{status}", (data.decode("utf-8", "replace") or f"HTTP {status}")
+        err_body: Optional[Dict[str, Any]] = None
         try:
             parsed = json.loads(data.decode("utf-8"))
             if isinstance(parsed, dict):
+                err_body = parsed
                 code = str(parsed.get("error") or code)
                 details = str(parsed.get("details") or details)
         except ValueError:
             pass  # non-JSON error body — keep the status fallback
-        raise PdfOpsError(status, code, details)
+        raise PdfOpsError(status, code, details, err_body)
 
     def _post_pdf(self, path: str, parts: Sequence[Tuple[str, Optional[str], bytes, str]]) -> bytes:
         ctype, body = _multipart(parts)
@@ -251,6 +343,24 @@ class PdfOps:
         (string or ``{"name", "lines"}``), ``items`` (``description``,
         ``unit_price``, optional ``quantity``), optional ``invoice_number``,
         ``date``, ``due``, ``currency``, ``tax_rate``, ``notes``.
+
+        Set ``"e_invoice": "factur-x"`` for a Factur-X / ZUGFeRD e-invoice (PDF/A-3
+        with the data embedded as ``factur-x.xml``, profile EN 16931). That mode
+        also needs ``invoice_number``, ``date``, ``currency``, ``due`` (a
+        YYYY-MM-DD date) or ``payment_terms``, ``from`` and ``to`` as objects
+        (``name``, ``country`` as an ISO 3166-1 alpha-2 code, optional ``street``,
+        ``postcode``, ``city``, ``vat_id``, ``tax_id``, ``registration_id``), a
+        seller identification (``from.vat_id``, or ``from.tax_id`` with
+        ``from.registration_id``), a ``unit`` code (UN/ECE Recommendation 20, e.g.
+        ``"C62"``) on every item, and ``tax_category`` (``S|Z|E|AE|O``) when
+        ``tax_rate`` is 0 or omitted. Optional: ``tax_exemption_reason`` (needed
+        for ``E``, ``AE``, ``O``), ``iban``. Unknown fields are refused.
+
+        Errors with ``e_invoice``: ``einvoice_fields_required`` (the full error
+        body is ``PdfOpsError.body``; ``body["missing"]`` lists every missing
+        field), ``invalid_einvoice_field``,
+        ``unrenderable_text`` (characters outside Latin, Latin Extended-A, euro
+        sign and common punctuation).
         """
         body = json.dumps(dict(request)).encode("utf-8")
         return self._request("POST", "/api/invoice", self._headers({"Content-Type": "application/json"}), body)
@@ -424,6 +534,317 @@ class PdfOps:
             "password": password,
         }
         return self._post_fields("/api/set-metadata", pdf, fields)[1]
+
+    def extract_text(
+        self,
+        pdf: PdfInput,
+        *,
+        pages: Optional[str] = None,
+        tables_format: Optional[str] = None,
+        password: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Read the text layer of a born-digital PDF (no OCR): reading-order text,
+        positioned lines and detected tables per page. ``pages`` is a 1-based spec
+        such as ``"1-3,5,8-"``; default all. ``tables_format="csv"`` adds a ``csv``
+        string (RFC 4180) to every table; ``rows`` is unchanged.
+
+        Returns ``{"pageCount", "pages": [{"page", "width", "height", "text", "lines",
+        "tables"}], "pagesWithoutText", "truncated"}``. When ``truncated`` is true the
+        read stopped at a cap: continue with ``pages=f"{last_page + 1}-"``. For plain
+        text see :meth:`extract_text_plain`; for a workbook, :meth:`extract_tables_xlsx`.
+
+        Errors: ``invalid_pages``, ``invalid_tables_format``, ``encrypted_pdf``,
+        ``decompressed_too_large``, ``too_many_pages``.
+        """
+        if tables_format == "xlsx":
+            raise ValueError('tables_format="xlsx" returns a workbook, not JSON: use extract_tables_xlsx()')
+        _, data = self._post_fields("/api/extract-text", pdf, {"pages": pages, "tables_format": tables_format, "password": password})
+        return json.loads(data.decode("utf-8"))
+
+    def extract_text_plain(
+        self, pdf: PdfInput, *, pages: Optional[str] = None, password: Optional[str] = None
+    ) -> ExtractTextPlainResult:
+        """Like :meth:`extract_text` with ``format=text``: the pages' text joined by a
+        form feed. ``truncated`` is the ``X-PDFops-Truncated`` header (continue with
+        ``pages=`` the page after the last one you got)."""
+        headers, data = self._post_fields("/api/extract-text", pdf, {"format": "text", "pages": pages, "password": password})
+        return ExtractTextPlainResult(text=data.decode("utf-8"), truncated=_header(headers, "x-pdfops-truncated") == "true")
+
+    def extract_tables_xlsx(
+        self, pdf: PdfInput, *, pages: Optional[str] = None, password: Optional[str] = None
+    ) -> ExtractTablesXlsxResult:
+        """Like :meth:`extract_text` with ``tables_format=xlsx``: one .xlsx workbook with
+        a sheet per detected table (``"Page 3 Table 1"``), every cell a string.
+        ``truncated``, ``truncated_by`` and ``cells_truncated`` are the
+        ``X-PDFops-*`` response headers.
+
+        Errors: ``no_tables`` (no table on the selected pages; if the read was cut
+        short, ``PdfOpsError.body`` also has ``truncated`` and ``nextPage``), plus
+        those of :meth:`extract_text`.
+        """
+        headers, data = self._post_fields("/api/extract-text", pdf, {"tables_format": "xlsx", "pages": pages, "password": password})
+        by = _header(headers, "x-pdfops-truncated-by") or ""
+        return ExtractTablesXlsxResult(
+            xlsx=data,
+            truncated=_header(headers, "x-pdfops-truncated") == "true",
+            truncated_by=[b for b in by.split(",") if b],
+            cells_truncated=_header(headers, "x-pdfops-cells-truncated") == "true",
+        )
+
+    def find_text(
+        self,
+        pdf: PdfInput,
+        query: str,
+        *,
+        regex: Optional[bool] = None,
+        case_sensitive: Optional[bool] = None,
+        whole_word: Optional[bool] = None,
+        pages: Optional[str] = None,
+        max_hits: Optional[int] = None,
+        password: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Search the text layer for a literal string (or, with ``regex=True``, a
+        pattern from a linear-time regex subset). Matches within one line, case
+        insensitive unless ``case_sensitive=True``.
+
+        Returns ``{"count", "truncated", "hits": [{"page", "text", "line", "x", "y",
+        "width", "height"}], "pagesWithoutText", "pagesScanned", "nextPage"}``;
+        x/y/width/height are PDF points in the :meth:`edit` frame (y is the baseline).
+        When ``nextPage`` is not ``None`` the scan stopped early: repeat with
+        ``pages=f"{nextPage}-"``. ``pagesSkipped`` and ``linesSkipped`` appear only
+        when non-empty.
+
+        Errors: ``missing_query``, ``query_too_long``, ``invalid_regex``,
+        ``invalid_parameter``, ``invalid_pages``.
+        """
+        fields = {
+            "query": query,
+            "regex": None if regex is None else str(bool(regex)).lower(),
+            "case_sensitive": None if case_sensitive is None else str(bool(case_sensitive)).lower(),
+            "whole_word": None if whole_word is None else str(bool(whole_word)).lower(),
+            "pages": pages, "max_hits": max_hits, "password": password,
+        }
+        _, data = self._post_fields("/api/find-text", pdf, fields)
+        return json.loads(data.decode("utf-8"))
+
+    def edit(
+        self,
+        pdf: PdfInput,
+        items: Sequence[Mapping[str, Any]],
+        *,
+        images: Optional[Mapping[str, PdfInput]] = None,
+        password: Optional[str] = None,
+    ) -> bytes:
+        """Stamp text, images and barcodes onto pages (1-100 ``items``). Coordinates
+        are PDF points from the bottom-left of the page as displayed.
+
+        Each item is a dict with ``type`` and ``page`` (1-based), ``x``, ``y``:
+        ``"text"`` (``text``, optional ``size``, ``color``, ``font``, ``opacity``,
+        ``rotation``, ``maxWidth``, ``lineHeight``), ``"image"`` (``image`` names a key
+        of ``images``; optional ``width``, ``height``, ``opacity``) or ``"barcode"``
+        (``format``, ``value``, optional ``width``, ``height``, ``color``,
+        ``background``, ``includeText``, ``errorCorrection``, ``opacity``).
+        ``images`` maps those names to PNG or JPEG data (bytes, path or binary file
+        object, 2 MB each, at most 10). Keys must match ``[A-Za-z0-9_.-]{1,64}`` and
+        may not be ``pdf``, ``password`` or ``items`` (``ValueError`` before sending).
+
+        Errors: ``invalid_items``, ``too_many_items``, ``unsupported_characters``,
+        ``invalid_pages``, ``invalid_image``.
+        """
+        parts: List[Tuple[str, Optional[str], bytes, str]] = [
+            ("pdf", "input.pdf", _read_pdf(pdf), "application/pdf"),
+            ("items", None, json.dumps(list(items)).encode("utf-8"), "application/json"),
+        ]
+        if password is not None:
+            parts.append(("password", None, password.encode("utf-8"), "text/plain"))
+        for name, image in (images or {}).items():
+            if not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", name) or name in ("pdf", "password", "items"):
+                raise ValueError(f"image key {name!r} must match [A-Za-z0-9_.-]{{1,64}} and not be pdf, password or items")
+            parts.append((name, name, _read_pdf(image), "application/octet-stream"))
+        return self._post_pdf("/api/edit", parts)
+
+    def add_fields(
+        self, pdf: PdfInput, fields: Sequence[Mapping[str, Any]], *, password: Optional[str] = None
+    ) -> AddFieldsResult:
+        """Create AcroForm fields (1-200) on a PDF. Each field is a dict with ``type``
+        (``"text"``, ``"checkbox"``, ``"radio"``, ``"dropdown"``, ``"signature"``),
+        ``name`` (unique, no ``"."``), ``page`` (1-based), ``x``, ``y``, ``width``,
+        ``height`` (points from the bottom-left of the displayed page, the :meth:`edit`
+        frame), optional ``required``, ``read_only``, ``border``, plus per type:
+        text ``multiline``, ``max_length``, ``default``, ``font_size`` (number or
+        ``"auto"``); checkbox ``checked``; radio ``options`` (``[{"value", "x", "y",
+        "width", "height"}]``) and ``default``; dropdown ``options`` (strings),
+        ``default``, ``font_size``. ``warning`` on the result is the
+        ``x-pdfops-warning`` header (an XFA layer was dropped).
+
+        Errors: ``invalid_fields``, ``too_many_fields``, ``duplicate_field``,
+        ``invalid_pages``, ``unsupported_characters``.
+        """
+        headers, data = self._post_fields("/api/add-fields", pdf, {"fields": json.dumps(list(fields)), "password": password})
+        return AddFieldsResult(pdf=data, warning=_header(headers, "x-pdfops-warning"))
+
+    def attach(
+        self,
+        pdf: PdfInput,
+        files: Sequence[Union[Tuple[str, PdfInput], List[Any], PdfInput]],
+        *,
+        options: Optional[Sequence[Mapping[str, str]]] = None,
+        password: Optional[str] = None,
+    ) -> AttachResult:
+        """Embed files in a PDF (e.g. a ZUGFeRD XML). Each of ``files`` is a
+        ``(filename, data)`` pair (a 2-item list works too), or a bare path (``str`` or
+        ``os.PathLike``; its basename is the name). In a pair ``data`` is bytes, a
+        bytearray, a binary file object or an ``os.PathLike`` to read; a plain ``str``
+        is refused (``TypeError``) so text is never mistaken for a path: pass bytes, or
+        ``pathlib.Path(...)`` to read a file. Bare bytes or file objects are named
+        ``file-<i>``. A filename containing ``"`` is sent as the safe part name
+        ``file-<i>`` with the real name in ``options[i]["name"]`` (unless you set one);
+        a backslash, CR, LF or NUL in a name raise ``ValueError`` (the API refuses
+        backslashes in attachment names). ``options`` is a list whose i-th
+        entry applies to the i-th file: ``{"name", "mime_type", "description",
+        "relationship"}`` (``relationship`` is ``Alternative|Data|Source|Supplement|
+        Unspecified``). ``attachment_keys`` on the result is the
+        ``x-pdfops-attachment-keys`` header, parsed.
+
+        Errors: ``missing_files``, ``too_many_files``, ``files_too_large``,
+        ``invalid_options``, ``invalid_name``, ``invalid_relationship``,
+        ``duplicate_name``, ``too_many_attachments``.
+        """
+        parts: List[Tuple[str, Optional[str], bytes, str]] = [("pdf", "input.pdf", _read_pdf(pdf), "application/pdf")]
+        opts: List[Dict[str, Any]] = [dict(o or {}) for o in options] if options is not None else []
+        for i, f in enumerate(files):
+            if isinstance(f, (tuple, list)):
+                if len(f) != 2:
+                    raise ValueError("a file pair must be (filename, data)")
+                name, data = f
+                if hasattr(name, "__fspath__"):
+                    name = os.path.basename(os.fspath(name))
+                if not isinstance(name, str):
+                    raise TypeError("the filename in a (filename, data) pair must be a str or a path")
+                if isinstance(data, str):
+                    raise TypeError("pass bytes, or pathlib.Path(...) to read a file")
+            elif isinstance(f, str) or hasattr(f, "__fspath__"):
+                name, data = os.path.basename(os.fspath(f)), f  # type: ignore[arg-type]
+            else:
+                name, data = f"file-{i}", f
+            if any(ch in name for ch in "\r\n\0\\"):
+                raise ValueError(f"file name may not contain a backslash, CR, LF or NUL: {name!r}")
+            part_name = name
+            if '"' in name:
+                # The handler takes the attachment name from options[i].name over the part filename.
+                part_name = f"file-{i}"
+                while len(opts) <= i:
+                    opts.append({})
+                opts[i].setdefault("name", name)
+            parts.append(("file", part_name, _read_pdf(data), _attachment_mime(name)))
+        if opts:
+            parts.append(("options", None, json.dumps(opts).encode("utf-8"), "application/json"))
+        if password is not None:
+            parts.append(("password", None, password.encode("utf-8"), "text/plain"))
+        ctype, body = _multipart(parts)
+        headers, data_out = self._request_full("POST", "/api/attach", self._headers({"Content-Type": ctype}), body)
+        try:  # a response header is untrusted: never raise after a successful call
+            parsed = json.loads(_header(headers, "x-pdfops-attachment-keys") or "[]")
+        except ValueError:
+            parsed = []
+        # All or nothing: dropping one bad entry would shift the rest against the files sent.
+        ok = (
+            isinstance(parsed, list)
+            and len(parsed) == len(files)
+            and all(isinstance(k, dict) and isinstance(k.get("name"), str) and isinstance(k.get("key"), str) for k in parsed)
+        )
+        keys = [{"name": k["name"], "key": k["key"]} for k in parsed] if ok else []
+        return AttachResult(pdf=data_out, attachment_keys=keys)
+
+    def html_to_pdf(
+        self,
+        html: str,
+        *,
+        page_size: Optional[str] = None,
+        landscape: Optional[bool] = None,
+        margin: Optional[Union[float, Mapping[str, float]]] = None,
+        print_background: Optional[bool] = None,
+        scale: Optional[float] = None,
+    ) -> HtmlToPdfResult:
+        """Render an HTML document to PDF in a headless browser. ``page_size`` is
+        ``"letter"`` (default) or ``"a4"``; ``margin`` is points (0-144) or a
+        ``{"top", "right", "bottom", "left"}`` dict (default 36); ``print_background``
+        defaults to true; ``scale`` is 0.1-2. ``pages`` and ``blocked_requests`` on the
+        result are the ``x-pdfops-pages`` and ``x-pdfops-blocked-requests`` headers.
+        Each successful call costs more quota than the other endpoints.
+
+        Errors: ``invalid_html``, ``html_too_large``, ``invalid_page_size``,
+        ``invalid_parameter``, ``too_many_pages``, ``too_many_resources``,
+        ``resources_too_large``, ``output_too_large``, ``image_too_large``,
+        ``unsupported_image``, ``render_timeout``, ``renderer_busy`` and
+        ``renderer_unavailable`` (retry shortly).
+        """
+        opts = {"page_size": page_size, "landscape": landscape, "margin": margin, "print_background": print_background, "scale": scale}
+        body = json.dumps({"html": html, **{k: v for k, v in opts.items() if v is not None}}).encode("utf-8")
+        headers, data = self._request_full("POST", "/api/html-to-pdf", self._headers({"Content-Type": "application/json"}), body)
+        pages, blocked = _header(headers, "x-pdfops-pages"), _header(headers, "x-pdfops-blocked-requests")
+        return HtmlToPdfResult(
+            pdf=data,
+            pages=_digits(pages),
+            blocked_requests=_digits(blocked),
+        )
+
+    def image_to_pdf(
+        self,
+        images: Sequence[PdfInput],
+        *,
+        page_size: Optional[str] = None,
+        orientation: Optional[str] = None,
+        margin: Optional[float] = None,
+    ) -> bytes:
+        """Make a PDF with one page per JPG or PNG, in order. ``page_size`` is
+        ``"fit"`` (default: page = image size), ``"a4"`` or ``"letter"``;
+        ``orientation`` is ``"auto"`` (default), ``"portrait"`` or ``"landscape"``
+        (ignored for ``fit``); ``margin`` is points, 0-200.
+
+        Errors: ``missing_images``, ``too_many_images``, ``unsupported_image_format``,
+        ``invalid_image``, ``image_too_large``, ``images_too_large_together``,
+        ``image_aspect_ratio``, ``invalid_parameter``.
+        """
+        parts: List[Tuple[str, Optional[str], bytes, str]] = [
+            ("pdf", f"image-{i}", _read_pdf(img), "application/octet-stream") for i, img in enumerate(images)
+        ]
+        for name, value in {"page_size": page_size, "orientation": orientation, "margin": margin}.items():
+            if value is not None:
+                parts.append((name, None, str(value).encode("utf-8"), "text/plain"))
+        return self._post_pdf("/api/image-to-pdf", parts)
+
+    def text_to_pdf(
+        self,
+        content: str,
+        *,
+        format: Optional[str] = None,
+        page_size: Optional[str] = None,
+        margin: Optional[float] = None,
+        font_size: Optional[float] = None,
+        title: Optional[str] = None,
+        page_numbers: Optional[bool] = None,
+        monospace: Optional[bool] = None,
+    ) -> bytes:
+        """Lay out Markdown, plain text or CSV as a PDF (not HTML rendering).
+        ``format`` is ``"markdown"`` (default), ``"text"`` or ``"csv"``; ``page_size``
+        ``"letter"`` (default) or ``"a4"``; ``margin`` 18-144 pt (default 54);
+        ``font_size`` 6-36 pt (default 11); ``title`` sets the PDF title;
+        ``page_numbers`` adds a "Page n of N" footer; ``monospace`` applies to
+        ``"text"``. Deterministic: the same request gives the same bytes. Standard
+        fonts only, so characters outside WinAnsi are refused.
+
+        Errors: ``missing_content``, ``content_too_large``, ``invalid_format``,
+        ``invalid_page_size``, ``invalid_parameter``, ``unsupported_characters``,
+        ``invalid_csv``, ``too_many_columns``, ``csv_too_large``, ``table_too_wide``,
+        ``table_too_large``, ``content_too_complex``, ``too_many_pages``.
+        """
+        opts = {
+            "format": format, "page_size": page_size, "margin": margin, "font_size": font_size,
+            "title": title, "page_numbers": page_numbers, "monospace": monospace,
+        }
+        body = json.dumps({"content": content, **{k: v for k, v in opts.items() if v is not None}}).encode("utf-8")
+        return self._request("POST", "/api/text-to-pdf", self._headers({"Content-Type": "application/json"}), body)
 
     def usage(self) -> Dict[str, Any]:
         """Quota state for the configured key: tier, limit, used, remaining, period, resets_at."""
