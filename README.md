@@ -73,6 +73,8 @@ form = client.add_fields("in.pdf", [
     {"type": "text", "name": "Email", "page": 1, "x": 72, "y": 600, "width": 240, "height": 20},
     {"type": "checkbox", "name": "Agree", "page": 1, "x": 72, "y": 560, "width": 14, "height": 14},
 ])                                                  # form.pdf bytes; form.warning is the XFA header or None
+flat = client.detect_fields("flat.pdf")             # dict: fields[] (type, name, page, x, y, width, height, label, confidence), count, truncated; review it
+fillable = client.make_fillable("flat.pdf")         # fillable.pdf bytes; fillable.count, fillable.names, fillable.truncated
 sealed = client.attach("invoice.pdf", [("factur-x.xml", xml_bytes)], options=[{"relationship": "Data"}])
 print(sealed.attachment_keys)                       # [{"name": "factur-x.xml", "key": ...}]
 html = client.html_to_pdf("<h1>Report</h1>", page_size="a4", margin=24)   # html.pdf bytes; html.pages, html.blocked_requests
@@ -101,7 +103,7 @@ except PdfOpsError as e:
     print(e.code, (e.body or {}).get("missing"))
 ```
 
-PDF inputs may be `bytes`, a path (`str` / `pathlib.Path`), or a binary file object. Most calls that produce a PDF return `bytes`; the ones that also report response headers (`unlock`, `add_fields`, `attach`, `html_to_pdf`) return a small result object with the PDF in `.pdf`.
+PDF inputs may be `bytes`, a path (`str` / `pathlib.Path`), or a binary file object. Most calls that produce a PDF return `bytes`; the ones that also report response headers (`unlock`, `add_fields`, `detect_fields_pdf`, `attach`, `html_to_pdf`) return a small result object with the PDF in `.pdf`.
 
 ## API
 
@@ -127,6 +129,9 @@ PDF inputs may be `bytes`, a path (`str` / `pathlib.Path`), or a binary file obj
 | `find_text(pdf, query, *, regex, case_sensitive, whole_word, pages, max_hits, password)` | `POST /api/find-text` | `dict`: `count`, `truncated`, `hits[]` (page, text, line, x, y, width, height), `pagesScanned`, `nextPage` |
 | `edit(pdf, items, *, images, password)` | `POST /api/edit` | PDF `bytes` with text, image and barcode stamps |
 | `add_fields(pdf, fields, *, password)` | `POST /api/add-fields` | `AddFieldsResult`: `pdf` bytes plus optional `warning` |
+| `detect_fields(pdf, *, pages, max_pages, min_confidence, password)` | `POST /api/detect-fields` | `dict`: `count`, `truncated`, `nextPages`, `fields[]` (each one is valid for `add_fields`). Detects fields drawn as lines, boxes, underscores and checkboxes; review the result |
+| `detect_fields_pdf(pdf, *, pages, max_pages, min_confidence, password)` | `POST /api/detect-fields` (`format=pdf`) | `DetectFieldsPdfResult`: fillable `pdf` bytes plus `count`, `names`, `truncated`, `truncated_by`, `next_pages`, `pages_skipped`, `warning`. Raises `no_fields` when nothing is found |
+| `make_fillable(pdf, *, pages, max_pages, min_confidence, password, max_rounds=25)` | `POST /api/detect-fields` (`format=pdf`), repeated | `DetectFieldsPdfResult` after sending the result back with `pages=next_pages` until `truncated` is false (each round is one metered call). Continues past `no_fields` while pages are left; when the loop ends early you get a partial result (the PDF so far with `truncated` true, `next_pages` and `stopped_by` = `{code, message}`; code is `stalled`, `max_rounds` or the API error code of the failed round) only if at least one field was added; otherwise it raises: `PdfOpsError` `no_fields` naming the stop (`stalled`, `max_rounds`) and the pages left in `body["nextPages"]`, or the failed round's own error unchanged |
 | `attach(pdf, files, *, options, password)` | `POST /api/attach` | `AttachResult`: `pdf` bytes plus `attachment_keys` |
 | `html_to_pdf(html, *, page_size, landscape, margin, print_background, scale)` | `POST /api/html-to-pdf` | `HtmlToPdfResult`: `pdf` bytes plus `pages`, `blocked_requests` |
 | `image_to_pdf(images, *, page_size, orientation, margin)` | `POST /api/image-to-pdf` | PDF `bytes`, one page per image |

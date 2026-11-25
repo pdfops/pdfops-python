@@ -29,9 +29,9 @@ from urllib import request as urlrequest
 
 __all__ = [
     "PdfOps", "PdfOpsError", "PdfInput", "SplitPart", "SplitResult", "UnlockResult", "AddFieldsResult",
-    "AttachResult", "ExtractTextPlainResult", "ExtractTablesXlsxResult", "HtmlToPdfResult", "__version__",
+    "AttachResult", "DetectFieldsPdfResult", "ExtractTextPlainResult", "ExtractTablesXlsxResult", "HtmlToPdfResult", "__version__",
 ]
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 #: A PDF given as raw bytes, a filesystem path, or a binary file object.
 PdfInput = Union[bytes, bytearray, memoryview, str, "os.PathLike[str]", IO[bytes]]
@@ -75,6 +75,33 @@ class AddFieldsResult:
     #: The API's ``x-pdfops-warning`` header: set when the input had an XFA layer
     #: that the save dropped. ``None`` otherwise.
     warning: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class DetectFieldsPdfResult:
+    #: The fillable PDF: the input plus the detected fields.
+    pdf: bytes
+    #: ``X-PDFops-Fields``: how many fields were added in this call.
+    count: int = 0
+    #: ``X-PDFops-Field-Names``: their names. A final ``"..."`` means the header was cut
+    #: and more names were added than are listed.
+    names: List[str] = field(default_factory=list)
+    #: ``X-PDFops-Truncated``: the answer is incomplete; send ``pdf`` again with
+    #: ``pages=next_pages`` (or use :meth:`PdfOps.make_fillable`).
+    truncated: bool = False
+    #: ``X-PDFops-Truncated-By``: ``pages``, ``fields`` and/or ``deadline``.
+    truncated_by: List[str] = field(default_factory=list)
+    #: ``X-PDFops-Next-Pages``: the pages not done, as a page spec, or ``None``.
+    next_pages: Optional[str] = None
+    #: ``X-PDFops-Pages-Skipped``: pages not analysed because they hold more shapes or text
+    #: than the per-page limits. Sending them again gives the same answer.
+    pages_skipped: List[int] = field(default_factory=list)
+    #: ``x-pdfops-warning``: the input had an XFA layer that the save dropped.
+    warning: Optional[str] = None
+    #: Set by :meth:`PdfOps.make_fillable` when a later round failed (quota, size, network):
+    #: ``{"code", "message"}``. ``pdf`` and ``count`` then hold what the earlier rounds added
+    #: and ``next_pages`` the pages to resume with.
+    stopped_by: Optional[Dict[str, str]] = None
 
 
 @dataclass(frozen=True)
@@ -682,6 +709,206 @@ class PdfOps:
         """
         headers, data = self._post_fields("/api/add-fields", pdf, {"fields": json.dumps(list(fields)), "password": password})
         return AddFieldsResult(pdf=data, warning=_header(headers, "x-pdfops-warning"))
+
+    def detect_fields(
+        self,
+        pdf: PdfInput,
+        *,
+        pages: Optional[str] = None,
+        max_pages: Optional[int] = None,
+        min_confidence: Optional[float] = None,
+        password: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Suggest fillable fields for a flat PDF. Detects fields drawn as lines, boxes,
+        underscores and checkboxes; review the result. Nothing is added: the PDF is not
+        changed.
+
+        Returns ``{"pages", "count", "truncated", "fields": [{"type", "name", "page",
+        "x", "y", "width", "height", "label", "confidence"}]}``, plus ``nextPage``,
+        ``nextPages``, ``pagesSkipped`` and ``note`` when they apply. Each entry in
+        ``fields`` can be passed to :meth:`add_fields` as it is. ``pages`` is a 1-based
+        spec such as ``"1-3,5,8-"``; ``max_pages`` (default 40, at most 100) and
+        ``min_confidence`` (0 to 1, default 0.4) bound the read. When ``truncated`` is
+        true: add the fields, then call again on the resulting PDF with
+        ``pages=nextPages``; repeat until ``truncated`` is false. For the fillable PDF
+        in one call see :meth:`detect_fields_pdf`, and :meth:`make_fillable` for the loop.
+
+        Errors: ``invalid_pdf``, ``encrypted_pdf``, ``decompressed_too_large``,
+        ``too_many_pages``, ``invalid_pages``, ``invalid_parameter``.
+        """
+        _, data = self._post_fields(
+            "/api/detect-fields", pdf,
+            {"pages": pages, "max_pages": max_pages, "min_confidence": min_confidence, "password": password},
+        )
+        return json.loads(data.decode("utf-8"))
+
+    def detect_fields_pdf(
+        self,
+        pdf: PdfInput,
+        *,
+        pages: Optional[str] = None,
+        max_pages: Optional[int] = None,
+        min_confidence: Optional[float] = None,
+        password: Optional[str] = None,
+    ) -> DetectFieldsPdfResult:
+        """Like :meth:`detect_fields` with ``format=pdf``: detects the fields and adds
+        them in one request, returning the fillable PDF. ``count``, ``names``,
+        ``truncated``, ``truncated_by``, ``next_pages`` and ``pages_skipped`` are the
+        ``X-PDFops-*`` response headers; when ``truncated`` is true, send ``pdf`` again
+        with ``pages=next_pages`` (the original PDF again repeats the same names).
+
+        Errors: ``no_fields`` (nothing detected, no PDF is made; ``PdfOpsError.body``
+        also has ``truncated`` and ``nextPages`` when pages were left), plus those of
+        :meth:`detect_fields` and ``too_many_fields``, ``duplicate_field``.
+        """
+        headers, data = self._post_fields(
+            "/api/detect-fields", pdf,
+            {"format": "pdf", "pages": pages, "max_pages": max_pages, "min_confidence": min_confidence, "password": password},
+        )
+        names: List[str] = []
+        try:
+            parsed = json.loads(_header(headers, "x-pdfops-field-names") or "[]")
+            if isinstance(parsed, list):
+                names = [n for n in parsed if isinstance(n, str)]
+        except ValueError:
+            pass
+        by = _header(headers, "x-pdfops-truncated-by") or ""
+        skipped = _header(headers, "x-pdfops-pages-skipped") or ""
+        return DetectFieldsPdfResult(
+            pdf=data,
+            count=_digits(_header(headers, "x-pdfops-fields")) or 0,
+            names=names,
+            truncated=_header(headers, "x-pdfops-truncated") == "true",
+            truncated_by=[b for b in by.split(",") if b],
+            next_pages=_header(headers, "x-pdfops-next-pages"),
+            pages_skipped=[int(p) for p in skipped.split(",") if p.isdigit()],
+            warning=_header(headers, "x-pdfops-warning"),
+        )
+
+    def make_fillable(
+        self,
+        pdf: PdfInput,
+        *,
+        pages: Optional[str] = None,
+        max_pages: Optional[int] = None,
+        min_confidence: Optional[float] = None,
+        password: Optional[str] = None,
+        max_rounds: int = 25,
+    ) -> DetectFieldsPdfResult:
+        """Make a flat PDF fillable: runs :meth:`detect_fields_pdf` and, while the answer is
+        truncated, sends the resulting PDF again with ``pages=next_pages``, until it is
+        complete or ``max_rounds`` calls were made (each call is metered). Returns the
+        final PDF with ``count`` and ``names`` summed over the rounds (``names`` can
+        include a ``"..."`` marker), ``pages_skipped`` merged, and ``truncated`` still true
+        if the round limit stopped it. ``no_fields`` with pages left (``truncated`` and
+        ``nextPages``) is not the end: the loop goes on with those pages. A round that
+        finds nothing new for the pages it sent ends the loop, and a document with no
+        detectable fields anywhere raises ``no_fields``. If a later round fails (quota,
+        size, network) the PDF and counts so far are returned with ``truncated`` true,
+        ``next_pages`` to resume with and the error in ``stopped_by``; a first-round
+        failure raises. Any stop that leaves pages undone sets ``stopped_by`` (``code``
+        ``stalled``, ``max_rounds``, or the API or network error), and the partial PDF is
+        returned only if at least one field was added; otherwise the call raises.
+        ``warning`` is the first XFA warning seen. Review the result: fields are
+        suggestions.
+        """
+        # Continuation rules (the same in the Python and JS SDKs and the n8n node):
+        #  - A round that adds fields or answers no_fields with nextPages goes on with those pages.
+        #  - The same pages offered again with nothing added is a stall (stop code "stalled"); the
+        #    round limit is "max_rounds"; a later-round API or network failure keeps its own code.
+        #  - A partial result is returned only if at least one field was added. With none, the call
+        #    fails: a later-round error is raised as it is, a stall or the round limit raises
+        #    no_fields saying which pages remain, and a final no_fields carries the skipped pages.
+        #  - Only too_complex skips are final and accumulate; a deadline skip is offered again in
+        #    nextPages and is not "not analysed".
+        #  - A finished job (not truncated) has no truncated_by and no next_pages.
+        if max_rounds < 1:
+            raise ValueError("max_rounds must be at least 1")
+        current = _read_pdf(pdf)
+        count, names, skipped = 0, [], set()  # type: int, List[str], set
+        warning: Optional[str] = None
+        truncated_by: List[str] = []
+        next_pages: Optional[str] = None
+        truncated = False
+        stopped_by: Optional[Dict[str, str]] = None
+        stop_error: Optional[BaseException] = None
+        last_no_fields: Optional[PdfOpsError] = None
+        send_pages = pages
+        for i in range(max_rounds):
+            try:
+                res = self.detect_fields_pdf(
+                    current, pages=send_pages, max_pages=max_pages, min_confidence=min_confidence, password=password,
+                )
+            except PdfOpsError as e:
+                body = e.body or {}
+                if e.code == "no_fields":
+                    last_no_fields = e
+                    for sk in body.get("pagesSkipped") or []:
+                        if isinstance(sk, dict) and isinstance(sk.get("page"), int) and sk.get("reason") == "too_complex":
+                            skipped.add(sk["page"])
+                    nxt = body.get("nextPages")
+                    next_pages = nxt if isinstance(nxt, str) and nxt else None
+                    truncated = bool(body.get("truncated")) and next_pages is not None
+                    if truncated and next_pages != send_pages:
+                        send_pages = next_pages
+                        continue
+                    if truncated:
+                        stopped_by = {"code": "stalled", "message": f"pages {next_pages} were offered again and nothing was found on them"}
+                    break
+                if i == 0:
+                    raise
+                stop_error = e
+                stopped_by = {"code": e.code, "message": str(e.details)}
+                truncated = True
+                next_pages = send_pages
+                break
+            except Exception as e:  # network failure and the like, after a metered round
+                if i == 0:
+                    raise
+                stop_error = e
+                stopped_by = {"code": "network_error", "message": str(e)}
+                truncated = True
+                next_pages = send_pages
+                break
+            last_no_fields = None
+            count += res.count
+            names += res.names
+            skipped.update(res.pages_skipped)
+            warning = warning or res.warning
+            truncated_by = res.truncated_by
+            current = res.pdf
+            truncated, next_pages = res.truncated, res.next_pages
+            if not truncated or not next_pages:
+                break
+            if next_pages == send_pages and res.count == 0:
+                stopped_by = {"code": "stalled", "message": f"pages {next_pages} were offered again and nothing new was found on them"}
+                break
+            send_pages = next_pages
+        else:
+            truncated = True  # round limit reached with pages left
+            stopped_by = {"code": "max_rounds", "message": f"stopped at the limit of {max_rounds} calls"}
+        if not truncated:
+            truncated_by, next_pages = [], None
+        if count == 0:
+            if stop_error is not None:
+                raise stop_error
+            skipped_body = [{"page": p, "reason": "too_complex"} for p in sorted(skipped)]
+            if stopped_by is not None:
+                left = f"; pages {next_pages} remain" if next_pages else ""
+                raise PdfOpsError(
+                    400, "no_fields", f"No fields found in the pages analysed so far{left} (stopped: {stopped_by['code']}).",
+                    {"error": "no_fields", "truncated": True, "nextPages": next_pages, "stoppedBy": stopped_by["code"],
+                     **({"pagesSkipped": skipped_body} if skipped_body else {})},
+                )
+            if last_no_fields is not None:
+                if not skipped_body:
+                    raise last_no_fields
+                raise PdfOpsError(last_no_fields.status, "no_fields", last_no_fields.details,
+                                  {**(last_no_fields.body or {}), "pagesSkipped": skipped_body})
+        return DetectFieldsPdfResult(
+            pdf=current, count=count, names=names, truncated=truncated, truncated_by=truncated_by,
+            next_pages=next_pages, pages_skipped=sorted(skipped), warning=warning, stopped_by=stopped_by,
+        )
 
     def attach(
         self,

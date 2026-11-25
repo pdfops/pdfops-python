@@ -365,6 +365,201 @@ class EdgeSuite(unittest.TestCase):
         self.assertEqual(PdfOps(transport=t).add_fields(PDF, fields, password="pw").warning, "xfa-layer-dropped; ...")
         self.assertEqual(text_fields(t)[1][-1], ("password", "pw"))
 
+    def test_detect_fields_json_posts_options_and_returns_body(self):
+        api = {"pages": [], "count": 1, "truncated": False, "fields": [{"type": "text", "name": "Name", "page": 1}]}
+        t = FakeTransport(body=json.dumps(api).encode())
+        res = PdfOps(transport=t).detect_fields(PDF, pages="1-2", max_pages=5, min_confidence=0.6, password="pw")
+        self.assertEqual(res, api)
+        url, parts = text_fields(t)
+        self.assertEqual(url, "https://pdfops.dev/api/detect-fields")
+        self.assertEqual(parts, [("pages", "1-2"), ("max_pages", "5"), ("min_confidence", "0.6"), ("password", "pw")])
+
+    def test_detect_fields_pdf_reads_headers(self):
+        hdrs = {
+            "X-PDFops-Fields": "8", "X-PDFops-Field-Names": json.dumps(["Name", "Date", "..."]),
+            "X-PDFops-Truncated": "true", "X-PDFops-Truncated-By": "pages,fields", "X-PDFops-Next-Pages": "41-80",
+            "X-PDFops-Pages-Skipped": "3,7", "x-pdfops-warning": "xfa",
+        }
+        t = FakeTransport(body=PDF, headers=hdrs)
+        res = PdfOps(transport=t).detect_fields_pdf(PDF, pages="1-")
+        self.assertEqual((res.pdf, res.count, res.names), (PDF, 8, ["Name", "Date", "..."]))
+        self.assertEqual((res.truncated, res.truncated_by, res.next_pages, res.pages_skipped, res.warning),
+                         (True, ["pages", "fields"], "41-80", [3, 7], "xfa"))
+        self.assertEqual(text_fields(t), ("https://pdfops.dev/api/detect-fields", [("format", "pdf"), ("pages", "1-")]))
+        res = PdfOps(transport=FakeTransport(body=PDF, headers={"X-PDFops-Fields": "2"})).detect_fields_pdf(PDF)
+        self.assertEqual((res.count, res.names, res.truncated, res.truncated_by, res.next_pages, res.pages_skipped),
+                         (2, [], False, [], None, []))
+
+    def test_detect_fields_pdf_no_fields_error_keeps_body(self):
+        body = {"error": "no_fields", "details": "none", "truncated": True, "nextPages": "5-"}
+        t = FakeTransport(status=400, body=json.dumps(body).encode())
+        with self.assertRaises(PdfOpsError) as cm:
+            PdfOps(transport=t).detect_fields_pdf(PDF)
+        self.assertEqual((cm.exception.code, cm.exception.body["nextPages"]), ("no_fields", "5-"))
+
+    def _rounds(self, rounds):
+        """A transport that answers each call from `rounds` ([(status, headers, body)]) in order."""
+        calls = []
+
+        def transport(method, url, headers, body):
+            calls.append(body)
+            return rounds[len(calls) - 1]
+        return transport, calls
+
+    def test_make_fillable_loops_until_not_truncated(self):
+        r1 = (200, {"X-PDFops-Fields": "200", "X-PDFops-Field-Names": '["A"]', "X-PDFops-Truncated": "true", "X-PDFops-Next-Pages": "3-9"}, b"PDF1")
+        r2 = (200, {"X-PDFops-Fields": "5", "X-PDFops-Field-Names": '["B"]', "X-PDFops-Pages-Skipped": "4"}, b"PDF2")
+        transport, calls = self._rounds([r1, r2])
+        res = PdfOps(transport=transport).make_fillable(PDF, pages="1-", password="pw")
+        self.assertEqual((res.pdf, res.count, res.names, res.truncated, res.pages_skipped), (b"PDF2", 205, ["A", "B"], False, [4]))
+        self.assertEqual(len(calls), 2)
+        self.assertIn(b"PDF1", calls[1])
+        self.assertIn(b"3-9", calls[1])
+        self.assertIn(b"pw", calls[1])
+
+    def test_make_fillable_stops_at_max_rounds(self):
+        r = (200, {"X-PDFops-Fields": "1", "X-PDFops-Truncated": "true", "X-PDFops-Next-Pages": "2-"}, b"P")
+        transport, calls = self._rounds([r, r, r])
+        res = PdfOps(transport=transport).make_fillable(PDF, max_rounds=3)
+        self.assertEqual((len(calls), res.count, res.truncated, res.next_pages), (3, 3, True, "2-"))
+        with self.assertRaises(ValueError):
+            PdfOps(transport=transport).make_fillable(PDF, max_rounds=0)
+
+    def test_make_fillable_later_no_fields_ends_the_loop_but_first_raises(self):
+        r1 = (200, {"X-PDFops-Fields": "3", "X-PDFops-Truncated": "true", "X-PDFops-Next-Pages": "2-"}, b"PDF1")
+        nf = (400, {}, json.dumps({"error": "no_fields", "details": "x", "truncated": False}).encode())
+        transport, calls = self._rounds([r1, nf])
+        res = PdfOps(transport=transport).make_fillable(PDF)
+        self.assertEqual((res.pdf, res.count, res.truncated), (b"PDF1", 3, False))
+        transport, _ = self._rounds([nf])
+        with self.assertRaises(PdfOpsError):
+            PdfOps(transport=transport).make_fillable(PDF)
+
+    def _nf(self, **body):
+        b = {"error": "no_fields", "details": "none", "truncated": False}
+        b.update(body)
+        return (400, {}, json.dumps(b).encode())
+
+    def _sent_pages(self, calls):
+        out = []
+        for body in calls:
+            m = re.search(rb'name="pages"[^\r]*\r\n(?:Content-Type: [^\r]*\r\n)?\r\n([^\r]*)', body)
+            out.append(m.group(1).decode() if m else None)
+        return out
+
+    def test_make_fillable_continues_past_no_fields_with_pages_left(self):
+        # prose on pages 1-40, the form on 41-60
+        rounds = [self._nf(truncated=True, nextPages="41-60"),
+                  (200, {"X-PDFops-Fields": "8", "X-PDFops-Field-Names": '["A"]'}, b"PDF2")]
+        transport, calls = self._rounds(rounds)
+        res = PdfOps(transport=transport).make_fillable(PDF)
+        self.assertEqual((res.pdf, res.count, res.truncated), (b"PDF2", 8, False))
+        self.assertEqual(self._sent_pages(calls), [None, "41-60"])
+        self.assertIn(PDF, calls[0])  # round 1 sends the original bytes
+
+    def test_make_fillable_mid_loop_no_fields_with_pages_left_continues(self):
+        r1 = (200, {"X-PDFops-Fields": "3", "X-PDFops-Truncated": "true", "X-PDFops-Next-Pages": "41-120"}, b"PDF1")
+        r3 = (200, {"X-PDFops-Fields": "2"}, b"PDF3")
+        transport, calls = self._rounds([r1, self._nf(truncated=True, nextPages="81-120"), r3])
+        res = PdfOps(transport=transport).make_fillable(PDF)
+        self.assertEqual((res.pdf, res.count, res.truncated, len(calls)), (b"PDF3", 5, False, 3))
+        self.assertIn(b"PDF1", calls[1])
+        self.assertIn(b"PDF1", calls[2])
+
+    def test_make_fillable_stall_with_no_fields_raises_with_stop_reason_and_pages_left(self):
+        nf = self._nf(truncated=True, nextPages="5-")
+        transport, calls = self._rounds([nf, nf, nf])
+        with self.assertRaises(PdfOpsError) as cm:
+            PdfOps(transport=transport).make_fillable(PDF)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(cm.exception.code, "no_fields")
+        self.assertEqual((cm.exception.body["stoppedBy"], cm.exception.body["nextPages"]), ("stalled", "5-"))
+        self.assertIn("pages 5- remain", str(cm.exception))
+
+    def test_make_fillable_stall_after_fields_keeps_the_partial_with_a_stop_code(self):
+        r1 = (200, {"X-PDFops-Fields": "3", "X-PDFops-Truncated": "true", "X-PDFops-Next-Pages": "2-"}, b"PDF1")
+        r2 = (200, {"X-PDFops-Truncated": "true", "X-PDFops-Next-Pages": "2-"}, b"PDF2")
+        transport, calls = self._rounds([r1, r2, r2])
+        res = PdfOps(transport=transport).make_fillable(PDF)
+        self.assertEqual((len(calls), res.count, res.truncated, res.next_pages, res.stopped_by["code"]), (2, 3, True, "2-", "stalled"))
+
+    def test_make_fillable_round_limit_has_a_stop_code_and_zero_fields_raises(self):
+        r = (200, {"X-PDFops-Fields": "1", "X-PDFops-Truncated": "true", "X-PDFops-Next-Pages": "2-"}, b"P")
+        transport, _ = self._rounds([r, r])
+        res = PdfOps(transport=transport).make_fillable(PDF, max_rounds=2)
+        self.assertEqual((res.truncated, res.stopped_by["code"]), (True, "max_rounds"))
+        nf1, nf2 = self._nf(truncated=True, nextPages="2-"), self._nf(truncated=True, nextPages="3-")
+        transport, _ = self._rounds([nf1, nf2])
+        with self.assertRaises(PdfOpsError) as cm:
+            PdfOps(transport=transport).make_fillable(PDF, max_rounds=2)
+        self.assertEqual((cm.exception.code, cm.exception.body["stoppedBy"], cm.exception.body["nextPages"]), ("no_fields", "max_rounds", "3-"))
+
+    def test_make_fillable_error_after_prose_only_rounds_raises_that_error(self):
+        quota = (429, {}, json.dumps({"error": "quota_exceeded", "details": "monthly quota used"}).encode())
+        transport, _ = self._rounds([self._nf(truncated=True, nextPages="41-"), quota])
+        with self.assertRaises(PdfOpsError) as cm:
+            PdfOps(transport=transport).make_fillable(PDF)
+        self.assertEqual(cm.exception.code, "quota_exceeded")
+
+    def test_make_fillable_deadline_skip_is_not_final_but_too_complex_is(self):
+        r1 = (200, {"X-PDFops-Fields": "2", "X-PDFops-Truncated": "true", "X-PDFops-Next-Pages": "2-"}, b"PDF1")
+        nf = self._nf(truncated=True, nextPages="42-", pagesSkipped=[{"page": 42, "reason": "deadline"}, {"page": 9, "reason": "too_complex"}])
+        r3 = (200, {"X-PDFops-Fields": "1"}, b"PDF3")
+        transport, _ = self._rounds([r1, nf, r3])
+        res = PdfOps(transport=transport).make_fillable(PDF)
+        self.assertEqual((res.count, res.truncated, res.pages_skipped), (3, False, [9]))
+
+    def test_make_fillable_final_no_fields_error_carries_earlier_too_complex_skips(self):
+        first = self._nf(truncated=True, nextPages="2-", pagesSkipped=[{"page": 1, "reason": "too_complex"}])
+        transport, _ = self._rounds([first, self._nf()])
+        with self.assertRaises(PdfOpsError) as cm:
+            PdfOps(transport=transport).make_fillable(PDF)
+        self.assertEqual((cm.exception.code, cm.exception.body["pagesSkipped"]), ("no_fields", [{"page": 1, "reason": "too_complex"}]))
+
+    def test_make_fillable_final_no_fields_after_truncation_clears_truncated_by(self):
+        r1 = (200, {"X-PDFops-Fields": "3", "X-PDFops-Truncated": "true", "X-PDFops-Next-Pages": "2-", "X-PDFops-Truncated-By": "pages"}, b"PDF1")
+        transport, _ = self._rounds([r1, self._nf()])
+        res = PdfOps(transport=transport).make_fillable(PDF)
+        self.assertEqual((res.truncated, res.truncated_by, res.next_pages), (False, [], None))
+
+    def test_make_fillable_no_fields_anywhere_raises_typed(self):
+        transport, _ = self._rounds([self._nf(truncated=True, nextPages="2-"), self._nf()])
+        with self.assertRaises(PdfOpsError) as cm:
+            PdfOps(transport=transport).make_fillable(PDF)
+        self.assertEqual(cm.exception.code, "no_fields")
+
+    def test_make_fillable_later_error_returns_the_partial_result(self):
+        r1 = (200, {"X-PDFops-Fields": "200", "X-PDFops-Field-Names": '["A"]', "X-PDFops-Truncated": "true", "X-PDFops-Next-Pages": "3-9"}, b"PDF1")
+        quota = (429, {}, json.dumps({"error": "quota_exceeded", "details": "monthly quota used"}).encode())
+        transport, _ = self._rounds([r1, quota])
+        res = PdfOps(transport=transport).make_fillable(PDF)
+        self.assertEqual((res.pdf, res.count, res.names, res.truncated, res.next_pages), (b"PDF1", 200, ["A"], True, "3-9"))
+        self.assertEqual(res.stopped_by, {"code": "quota_exceeded", "message": "monthly quota used"})
+        # a network failure in round 2 is kept the same way; round 1 still raises
+        calls = []
+
+        def net(method, url, headers, body):
+            calls.append(1)
+            if len(calls) == 1:
+                return r1
+            raise OSError("connection reset")
+        res = PdfOps(transport=net).make_fillable(PDF)
+        self.assertEqual((res.count, res.stopped_by["code"], res.truncated), (200, "network_error", True))
+
+        def boom(method, url, headers, body):
+            raise OSError("down")
+        with self.assertRaises(OSError):
+            PdfOps(transport=boom).make_fillable(PDF)
+
+    def test_make_fillable_carries_first_warning_and_skipped_pages_from_errors(self):
+        r1 = (200, {"X-PDFops-Fields": "1", "X-PDFops-Truncated": "true", "X-PDFops-Next-Pages": "2-9",
+                    "x-pdfops-warning": "xfa-first", "X-PDFops-Truncated-By": "pages"}, b"PDF1")
+        r2 = (200, {"X-PDFops-Fields": "1", "X-PDFops-Truncated": "true", "X-PDFops-Next-Pages": "5-9"}, b"PDF2")
+        nf = self._nf(pagesSkipped=[{"page": 7, "reason": "too_complex"}])
+        transport, _ = self._rounds([r1, r2, nf])
+        res = PdfOps(transport=transport).make_fillable(PDF)
+        self.assertEqual((res.warning, res.pages_skipped, res.truncated, res.count), ("xfa-first", [7], False, 2))
+
     def test_attach_parts_options_and_keys_header(self):
         keys = [{"name": "data.xml", "key": "data.xml"}, {"name": "file-1", "key": "file-1"}]
         t = FakeTransport(body=PDF, headers={"X-Pdfops-Attachment-Keys": json.dumps(keys)})
