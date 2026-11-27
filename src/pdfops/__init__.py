@@ -7,7 +7,7 @@ Errors carry the API's structured ``{"error", "details"}`` body via
 
     from pdfops import PdfOps
 
-    client = PdfOps(api_key="pdfops_live_...")      # or PdfOps() for the keyless trial
+    client = PdfOps()      # keyless trial; with a free key from https://pdfops.dev/pricing: PdfOps(api_key="...")
     fields = client.inspect("blank.pdf")["fillTemplate"]
     fields["Name"] = "Ada Lovelace"
     open("filled.pdf", "wb").write(client.fill_form("blank.pdf", fields, flatten=True))
@@ -31,7 +31,7 @@ __all__ = [
     "PdfOps", "PdfOpsError", "PdfInput", "SplitPart", "SplitResult", "UnlockResult", "AddFieldsResult",
     "AttachResult", "DetectFieldsPdfResult", "ExtractTextPlainResult", "ExtractTablesXlsxResult", "HtmlToPdfResult", "__version__",
 ]
-__version__ = "0.5.0"
+__version__ = "0.5.1"
 
 #: A PDF given as raw bytes, a filesystem path, or a binary file object.
 PdfInput = Union[bytes, bytearray, memoryview, str, "os.PathLike[str]", IO[bytes]]

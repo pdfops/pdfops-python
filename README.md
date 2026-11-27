@@ -15,7 +15,7 @@ Zero dependencies (standard-library `urllib`), Python 3.9+, fully typed.
 ```python
 from pdfops import PdfOps
 
-client = PdfOps(api_key="pdfops_live_...")   # or PdfOps() for the keyless trial (100 req/IP/month)
+client = PdfOps()   # keyless trial (100 req/IP/month); with a free key from https://pdfops.dev/pricing: PdfOps(api_key="...")
 
 # 1. Discover the field names: you cannot fill fields you cannot name.
 info = client.inspect("blank-w9.pdf")
